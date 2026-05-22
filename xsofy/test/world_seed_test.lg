@@ -1,10 +1,10 @@
 (ns xsofy.test.world-seed-test
   "Determinism test: same seed yields same world generation outcome.
-   This is the integration test that locks down PR3's threading
-   contract — if any caller drops a thread or order shifts, the
-   golden values change."
+   Locks down PR3 + PR3b's threading contracts — if any caller drops
+   a thread or order shifts, the golden values change."
   (:require [test :refer [deftest is testing]]
             [xsofy.items :as items]
+            [xsofy.terrain :as terrain]
             [xsofy.det :as d]))
 
 (deftest items-roll-floor-loot-is-deterministic
@@ -64,3 +64,45 @@
         (let [e (first (items/roll-enchant {:seed seed} depth 0))]
           (is (and (>= e -3) (<= e 5))
               (str "out of range: " e " for seed " seed " depth " depth)))))))
+
+;; ============================================================================
+;; End-to-end terrain determinism — locks PR3b's contract
+;; ============================================================================
+
+(deftest terrain-generation-is-deterministic
+  (testing "Same seed → same terrain grid"
+    (let [w 40 h 15 depth 1
+          r1 (terrain/generate-level w h depth {:seed 42})
+          r2 (terrain/generate-level w h depth {:seed 42})
+          g1 (:grid (first r1))
+          g2 (:grid (first r2))
+          n (* w h)
+          equal (loop [i 0]
+                  (if (>= i n) true
+                    (if (= (aget g1 i) (aget g2 i))
+                      (recur (inc i))
+                      false)))]
+      (is equal))))
+
+(deftest terrain-different-seeds-differ
+  (testing "Different seeds yield substantially different terrain"
+    (let [w 40 h 15 depth 1
+          r1 (terrain/generate-level w h depth {:seed 1})
+          r2 (terrain/generate-level w h depth {:seed 2})
+          g1 (:grid (first r1))
+          g2 (:grid (first r2))
+          n (* w h)
+          diffs (loop [i 0 c 0]
+                  (if (>= i n) c
+                    (recur (inc i)
+                           (if (= (aget g1 i) (aget g2 i)) c (inc c)))))]
+      (is (>= diffs (quot n 10))
+          (str "expected >=" (quot n 10) " differing cells, got " diffs)))))
+
+(deftest terrain-advances-seed
+  (testing "Two consecutive calls produce different output seeds"
+    (let [r1 (terrain/generate-level 40 15 1 {:seed 42})
+          r2 (terrain/generate-level 40 15 1 (second r1))
+          s1 (:seed (second r1))
+          s2 (:seed (second r2))]
+      (is (not= s1 s2)))))

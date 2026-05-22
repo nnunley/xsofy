@@ -145,28 +145,31 @@
 
 (defn generate-floor [w h depth player]
   (dbg/log "generate-floor" w h "depth:" depth)
-  (let [{:keys [grid rooms]} (terrain/generate-level w h depth)
+  (let [;; seed up front; terrain consumes & advances it deterministically
+        initial-world {:seed depth}
+        terrain-result (terrain/generate-level w h depth initial-world)
+        {:keys [grid rooms]} (first terrain-result)
+        world-after-terrain (second terrain-result)
         [px py] (first rooms)]
     (dbg/log "  rooms:" (count rooms) "player-pos:" [px py])
     (let [lights (light/collect-terrain-lights grid w h)
-          ;; world carries an explicit per-floor seed so worldgen rolls
-          ;; are reproducible. depth alone disambiguates floors; if a
-          ;; caller wants a different seed it can pass in a player with
-          ;; :base-seed (not currently used).
-          world {:terrain grid
-                 :width w
-                 :height h
-                 :seed depth
-                 :entities {:player (assoc player :pos [px py])}
-                 :fov #{}
-                 :memory {}
-                 :lights lights
-                 :stains {}
-                 :gases {}
-                 :log []
-                 :turn 0
-                 :depth depth
-                 :running true}
+          ;; merge gameplay fields onto the terrain-advanced world.
+          ;; :seed from world-after-terrain is preserved (assoc doesn't drop existing keys
+          ;; we don't override).
+          world (assoc world-after-terrain
+                       :terrain grid
+                       :width w
+                       :height h
+                       :entities {:player (assoc player :pos [px py])}
+                       :fov #{}
+                       :memory {}
+                       :lights lights
+                       :stains {}
+                       :gases {}
+                       :log []
+                       :turn 0
+                       :depth depth
+                       :running true)
           world (det/with-context world [:worldgen :floor depth])]
       (dbg/log "  populating rooms")
       (let [;; spawn creatures per room (each call returns world')

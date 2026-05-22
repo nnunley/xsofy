@@ -1,4 +1,5 @@
-(ns xsofy.terrain)
+(ns xsofy.terrain
+  (:require [xsofy.det :as det]))
 
 ;; --- Tile Definitions ---
 
@@ -169,27 +170,38 @@
                 (recur (inc head) t (+ size added)))))))))
 
 (defn generate-blob
-  "Generate an organic blob via cellular automata.
-   Returns {:cells int-array :x :y :w :h} of bounding box, or nil if too small."
-  [bw bh seed-pct rounds birth survive min-w min-h]
-  (let [cells (atom (int-array (* bw bh)))]
-    ;; seed with random noise
-    (dotimes [i (* bw bh)]
-      (aset @cells i (if (< (rand-int 100) seed-pct) 1 0)))
-    ;; run CA rounds
+  "Generate an organic blob via cellular automata deterministically.
+   Returns [blob world'] where blob is {:cells int-array :x :y :w :h}
+   of bounding box (or nil if too small)."
+  [world bw bh seed-pct rounds birth survive min-w min-h]
+  (let [w-ctx (det/with-context world [:terrain :blob bw bh seed-pct rounds])
+        sz (* bw bh)
+        arr (int-array sz)
+        cells (atom arr)
+        ;; seed with deterministic noise — loop+recur threads world
+        w-after-seed
+        (loop [i 0 w w-ctx]
+          (if (>= i sz)
+            w
+            (let [p (det/int-in w 0 100)
+                  r (first p)
+                  w' (second p)]
+              (aset @cells i (if (< r seed-pct) 1 0))
+              (recur (inc i) w'))))]
+    ;; run CA rounds (deterministic, no rolls)
     (dotimes [_ rounds]
       (reset! cells (ca-step @cells bw bh birth survive)))
     ;; find largest connected blob via flood fill using array BFS
-    (let [labels (int-array (* bw bh))
+    (let [labels (int-array sz)
           final-cells @cells]
       (loop [label-id 1 best-label 0 best-size 0 y 0 x 0]
         (cond
           (>= y bh)
           ;; done scanning — extract best blob
-          (when (> best-size 0)
+          (if (> best-size 0)
             (let [min-x (atom bw) max-x (atom 0)
                   min-y (atom bh) max-y (atom 0)
-                  result (int-array (* bw bh))]
+                  result (int-array sz)]
               (dotimes [ry bh]
                 (dotimes [rx bw]
                   (when (= (aget labels (+ rx (* ry bw))) best-label)
@@ -200,9 +212,12 @@
                     (when (> ry @max-y) (reset! max-y ry)))))
               (let [rw (inc (- @max-x @min-x))
                     rh (inc (- @max-y @min-y))]
-                (when (and (>= rw min-w) (>= rh min-h))
-                  {:cells result :bw bw :bh bh
-                   :x @min-x :y @min-y :w rw :h rh}))))
+                (if (and (>= rw min-w) (>= rh min-h))
+                  [{:cells result :bw bw :bh bh
+                    :x @min-x :y @min-y :w rw :h rh}
+                   w-after-seed]
+                  [nil w-after-seed])))
+            [nil w-after-seed])
 
           (>= x bw)
           (recur label-id best-label best-size (inc y) 0)
@@ -239,17 +254,26 @@
 ;; --- Cave Rooms ---
 ;; Carve an organic cave shape into the grid at a given position.
 
-(defn carve-cave-room! [grid w h cx cy]
-  "Carve a cave room centered near cx,cy. Returns center point or nil."
-  (let [cave-w (+ 8 (rand-int 10))
-        cave-h (+ 6 (rand-int 6))
-        blob (generate-blob cave-w cave-h 55 5
-                            #{5 6 7 8} #{4 5 6 7 8}
-                            4 3)]
-    (when blob
+(defn carve-cave-room!
+  "Carve a cave room centered near cx,cy deterministically.
+   Returns [center-or-nil world']."
+  [world grid w h cx cy]
+  (let [w-ctx (det/with-context world [:terrain :cave-room cx cy])
+        p1 (det/int-in w-ctx 0 10)
+        cave-w (+ 8 (first p1))
+        w1 (second p1)
+        p2 (det/int-in w1 0 6)
+        cave-h (+ 6 (first p2))
+        w2 (second p2)
+        blob-pair (generate-blob w2 cave-w cave-h 55 5
+                                 #{5 6 7 8} #{4 5 6 7 8}
+                                 4 3)
+        blob (first blob-pair)
+        w3 (second blob-pair)]
+    (if-not blob
+      [nil w3]
       (let [ox (- cx (quot (:w blob) 2))
             oy (- cy (quot (:h blob) 2))
-            ;; collect all carved cells to find true center
             carved (atom [])]
         (dotimes [by (:bh blob)]
           (dotimes [bx (:bw blob)]
@@ -258,10 +282,10 @@
                 (when (in-bounds? w h tx ty)
                   (tset! grid w tx ty 1)
                   (swap! carved conj [tx ty]))))))
-        (when (seq @carved)
-          ;; return the middle cell of all carved positions
+        (if (seq @carved)
           (let [mid (quot (count @carved) 2)]
-            (nth @carved mid)))))))
+            [(nth @carved mid) w3])
+          [nil w3])))))
 
 ;; --- Connectivity Check ---
 ;; Array-based BFS flood fill — no atoms, no allocations in the hot loop.
@@ -322,31 +346,41 @@
 ;; Generate blob-shaped lakes and place them without breaking connectivity.
 
 (defn place-lake!
-  "Place a blob lake of the given type. deep-tile is the interior,
-   shallow-tile (or nil) is the wreath around it.
-   size-class: :small (6-12), :medium (12-22), :large (20-35).
-   Returns true if placed."
-  [grid w h deep-tile shallow-tile wreath-width size-class]
-  (let [[min-w extra-w min-h extra-h] (case (or size-class :medium)
+  "Place a blob lake of the given type deterministically.
+   Returns [placed? world']."
+  [world grid w h deep-tile shallow-tile wreath-width size-class]
+  (let [w-ctx (det/with-context world [:terrain :lake deep-tile size-class])
+        [min-w extra-w min-h extra-h] (case (or size-class :medium)
                                          :small  [6 6 4 4]
                                          :medium [12 10 6 6]
                                          :large  [20 15 10 8])
-        lake-w (+ min-w (rand-int extra-w))
-        lake-h (+ min-h (rand-int extra-h))
-        blob (generate-blob lake-w lake-h 55 5
-                            #{5 6 7 8} #{4 5 6 7 8}
-                            3 3)
+        pw (det/int-in w-ctx 0 extra-w)
+        lake-w (+ min-w (first pw))
+        w1 (second pw)
+        ph (det/int-in w1 0 extra-h)
+        lake-h (+ min-h (first ph))
+        w2 (second ph)
+        blob-pair (generate-blob w2 lake-w lake-h 55 5
+                                 #{5 6 7 8} #{4 5 6 7 8}
+                                 3 3)
+        blob (first blob-pair)
+        w3 (second blob-pair)
         sz (* w h)]
-    (when blob
-      (let [placed (atom false)
-            backup (byte-array sz)
+    (if-not blob
+      [false w3]
+      (let [backup (byte-array sz)
             bcells (:cells blob)
             bbw (:bw blob)
             bbh (:bh blob)]
-        (dotimes [_ 15]
-          (when-not @placed
-            (let [ox (+ 2 (rand-int (max 1 (- w lake-w 4))))
-                  oy (+ 2 (rand-int (max 1 (- h lake-h 4))))
+        (loop [attempt 0 w-cur w3]
+          (if (>= attempt 15)
+            [false w-cur]
+            (let [px-pair (det/int-in w-cur 0 (max 1 (- w lake-w 4)))
+                  ox (+ 2 (first px-pair))
+                  w-after-x (second px-pair)
+                  py-pair (det/int-in w-after-x 0 (max 1 (- h lake-h 4)))
+                  oy (+ 2 (first py-pair))
+                  w-after-y (second py-pair)
                   changed (atom false)]
               ;; save backup
               (dotimes [i sz] (aset backup i (aget grid i)))
@@ -374,62 +408,90 @@
                                   (when (or (= 1 t) (= 2 t))
                                     (aset grid (+ tx (* ty w)) shallow-tile)
                                     (reset! changed true))))))))))))
-              ;; only check connectivity if we actually overwrote walkable tiles
               (if (not @changed)
-                ;; nothing changed, skip (try another position)
-                nil
+                (recur (inc attempt) w-after-y)
                 (if (is-connected? grid w h)
-                  (reset! placed true)
-                  ;; revert
-                  (dotimes [i sz]
-                    (aset grid i (aget backup i))))))))
-        @placed))))
+                  [true w-after-y]
+                  (do (dotimes [i sz] (aset grid i (aget backup i)))
+                      (recur (inc attempt) w-after-y)))))))))))
 
 ;; --- Probability Flood Spread ---
 ;; Brogue-style spreading: start at a point, flood outward with decreasing probability.
 ;; Each wave tries to spread to 4-neighbors at (prob)%, then prob decreases by decrement.
 ;; Produces large organic patches that can fill entire rooms.
 
-(defn spread-feature! [grid w h sx sy tile start-prob decrement allowed-tiles]
-  (let [visited (int-array (* w h))
-        ;; wave 0: seed
-        _ (aset visited (+ sx (* sy w)) 1)
-        wave (atom [[sx sy]])
-        prob (atom start-prob)]
-    (while (and (seq @wave) (> @prob 0))
-      (let [next-wave (atom [])]
-        (doseq [[cx cy] @wave]
-          (doseq [[dx dy] [[1 0] [-1 0] [0 1] [0 -1]]]
-            (let [nx (+ cx dx) ny (+ cy dy)
-                  idx (+ nx (* ny w))]
-              (when (and (in-bounds? w h nx ny)
-                         (= (aget visited idx) 0)
-                         (contains? allowed-tiles (tget grid w nx ny))
-                         (< (rand-int 100) @prob))
-                (aset visited idx 1)
-                (tset! grid w nx ny tile)
-                (swap! next-wave conj [nx ny])))))
-        (reset! wave @next-wave)
-        (swap! prob - decrement)))))
+(defn spread-feature!
+  "Brogue-style probability flood: spread tile out from (sx,sy) into
+   allowed-tiles, with falling probability per wave. Returns world'."
+  [world grid w h sx sy tile start-prob decrement allowed-tiles]
+  (let [w-ctx (det/with-context world [:terrain :spread tile sx sy])
+        visited (int-array (* w h))]
+    (aset visited (+ sx (* sy w)) 1)
+    (loop [wave [[sx sy]]
+           prob start-prob
+           w-cur w-ctx]
+      (if (or (empty? wave) (<= prob 0))
+        w-cur
+        (let [step
+              (loop [pending wave
+                     next-wave []
+                     w-loop w-cur]
+                (if (empty? pending)
+                  [next-wave w-loop]
+                  (let [[cx cy] (first pending)
+                        rest-pending (rest pending)
+                        nbr-step
+                        (loop [dirs [[1 0] [-1 0] [0 1] [0 -1]]
+                               nw next-wave
+                               w-inner w-loop]
+                          (if (empty? dirs)
+                            [nw w-inner]
+                            (let [[dx dy] (first dirs)
+                                  nx (+ cx dx) ny (+ cy dy)
+                                  idx (+ nx (* ny w))]
+                              (if (and (in-bounds? w h nx ny)
+                                       (= (aget visited idx) 0)
+                                       (contains? allowed-tiles (tget grid w nx ny)))
+                                (let [p (det/int-in w-inner 0 100)
+                                      r (first p)
+                                      w-next (second p)]
+                                  (if (< r prob)
+                                    (do (aset visited idx 1)
+                                        (tset! grid w nx ny tile)
+                                        (recur (rest dirs) (conj nw [nx ny]) w-next))
+                                    (recur (rest dirs) nw w-next)))
+                                (recur (rest dirs) nw w-inner)))))]
+                    (recur rest-pending (first nbr-step) (second nbr-step)))))]
+          (recur (first step) (- prob decrement) (second step)))))))
 
 ;; --- Grass Patches ---
 ;; Brogue-style: pick a random floor tile, spread grass from it.
 ;; start-prob 75, decrement 5 = can fill entire rooms.
 
-(defn place-grass-patch! [grid w h]
-  (let [;; find a random floor tile to seed from
-        attempts 30
-        found (atom nil)]
-    (dotimes [_ attempts]
-      (when-not @found
-        (let [x (+ 1 (rand-int (- w 2)))
-              y (+ 1 (rand-int (- h 2)))]
-          (when (= 1 (tget grid w x y))
-            (reset! found [x y])))))
-    (when @found
-      (let [[sx sy] @found]
+(defn place-grass-patch!
+  "Place a grass patch deterministically. Returns world'."
+  [world grid w h]
+  (let [w-ctx (det/with-context world [:terrain :grass])
+        find-result
+        (loop [attempt 0 w-cur w-ctx]
+          (if (>= attempt 30)
+            [nil w-cur]
+            (let [px (det/int-in w-cur 0 (- w 2))
+                  x (+ 1 (first px))
+                  w1 (second px)
+                  py (det/int-in w1 0 (- h 2))
+                  y (+ 1 (first py))
+                  w2 (second py)]
+              (if (= 1 (tget grid w x y))
+                [[x y] w2]
+                (recur (inc attempt) w2)))))
+        found (first find-result)
+        w-after-find (second find-result)]
+    (if-not found
+      w-after-find
+      (let [[sx sy] found]
         (tset! grid w sx sy 2)
-        (spread-feature! grid w h sx sy 2 75 5 #{1})))))
+        (spread-feature! w-after-find grid w h sx sy 2 75 5 #{1})))))
 
 ;; --- Bridge Building ---
 ;; After lakes are placed, scan for bridge opportunities.
@@ -511,35 +573,39 @@
           [@gx @gy @span])))))
 
 (defn build-bridges!
-  "Scan the grid for bridge opportunities. Build bridges that shorten
-   pathing distance by at least 3x the bridge length. Repeat until
-   no more useful bridges found."
-  [grid w h]
-  (let [built-any (atom true)
-        total (atom 0)]
-    (while (and @built-any (< @total 6))
-      (reset! built-any false)
-      ;; shuffle scan order for variety
-      (let [coords (shuffle (for [y (range 1 (dec h)) x (range 1 (dec w))] [x y]))]
-        (doseq [[x y] coords]
-          (when (and (not @built-any) (< @total 6)
-                     (contains? bridge-shore-tiles (tget grid w x y)))
-            ;; try all 4 directions
-            (doseq [[dx dy] [[1 0] [0 1] [-1 0] [0 -1]]]
-              (when (and (not @built-any) (< @total 6))
-                (when-let [[ex ey span] (try-bridge grid w h x y dx dy)]
-                  ;; would this bridge shorten the walk significantly?
-                  (let [detour (walk-distance grid w h x y ex ey (* span 6))]
-                    (when (or (nil? detour)           ;; unreachable = definitely bridge
-                              (> detour (* span 3)))  ;; detour > 3x bridge length
-                      ;; build it
-                      (let [bx (atom (+ x dx)) by (atom (+ y dy))]
-                        (dotimes [_ span]
-                          (tset! grid w @bx @by 17)
-                          (swap! bx + dx)
-                          (swap! by + dy)))
-                      (swap! total inc)
-                      (reset! built-any true))))))))))))
+  "Scan the grid for bridge opportunities deterministically. Build bridges
+   that shorten pathing distance by at least 3x the bridge length. Repeat
+   until no more useful bridges found. Returns world'."
+  [world grid w h]
+  (let [w-ctx (det/with-context world [:terrain :bridges])
+        built-any (atom true)
+        total (atom 0)
+        all-coords (vec (for [y (range 1 (dec h)) x (range 1 (dec w))] [x y]))]
+    ;; outer loop: each pass shuffles scan order and threads world
+    (loop [w-cur w-ctx]
+      (if (or (not @built-any) (>= @total 6))
+        w-cur
+        (let [_ (reset! built-any false)
+              shuf (det/permute w-cur all-coords)
+              coords (first shuf)
+              w-next (second shuf)]
+          (doseq [[x y] coords]
+            (when (and (not @built-any) (< @total 6)
+                       (contains? bridge-shore-tiles (tget grid w x y)))
+              (doseq [[dx dy] [[1 0] [0 1] [-1 0] [0 -1]]]
+                (when (and (not @built-any) (< @total 6))
+                  (when-let [[ex ey span] (try-bridge grid w h x y dx dy)]
+                    (let [detour (walk-distance grid w h x y ex ey (* span 6))]
+                      (when (or (nil? detour)
+                                (> detour (* span 3)))
+                        (let [bx (atom (+ x dx)) by (atom (+ y dy))]
+                          (dotimes [_ span]
+                            (tset! grid w @bx @by 17)
+                            (swap! bx + dx)
+                            (swap! by + dy)))
+                        (swap! total inc)
+                        (reset! built-any true))))))))
+          (recur w-next))))))
 
 ;; --- Room Attachment ---
 ;; After initial rooms are placed, try to grow new rooms from existing walls.
@@ -547,11 +613,17 @@
 
 (def ^:private floor-adj-tiles #{1 2 18})
 
-(defn find-wall-attachment-point [grid w h]
-  "Find a wall tile adjacent to floor on one side and solid wall on the other.
-   Uses reservoir sampling — single scan, O(1) memory, uniform random pick."
-  (let [chosen (atom nil)
-        count (atom 0)]
+(defn find-wall-attachment-point
+  "Find a wall tile adjacent to floor on one side and solid wall on
+   the other, sampled uniformly via reservoir sampling.
+   Returns [chosen-or-nil world'] where chosen is [x y -dx -dy] or nil.
+
+   Two-pass: first collect candidate cells (no rolls), then reservoir-
+   sample over the collected vector with threaded world."
+  [world grid w h]
+  (let [w-ctx (det/with-context world [:terrain :wall-attach])
+        ;; pass 1: collect candidate cells (no rolls)
+        candidates (atom [])]
     (dotimes [y h]
       (dotimes [x w]
         (when (and (in-bounds? w h x y) (= 8 (aget grid (+ x (* y w)))))
@@ -565,177 +637,317 @@
                          (let [rx (+ bx (* (- dx) 2)) ry (+ by (* (- dy) 2))]
                            (and (in-bounds? w h rx ry)
                                 (= 8 (aget grid (+ rx (* ry w)))))))
-                (swap! count inc)
-                ;; reservoir sampling: replace with probability 1/count
-                (when (= 0 (rand-int @count))
-                  (reset! chosen [x y (- dx) (- dy)]))))))))
-    @chosen))
+                (swap! candidates conj [x y (- dx) (- dy)])))))))
+    ;; pass 2: reservoir sample with threaded world
+    (let [cs @candidates
+          n (count cs)]
+      (if (zero? n)
+        [nil w-ctx]
+        (loop [i 0 chosen nil w-cur w-ctx]
+          (if (>= i n)
+            [chosen w-cur]
+            (let [pr (det/int-in w-cur 0 (inc i))
+                  r (first pr)
+                  w-next (second pr)]
+              (recur (inc i)
+                     (if (= r 0) (nth cs i) chosen)
+                     w-next))))))))
 
-(defn attach-room! [grid w h rooms]
-  "Try to attach a new room to an existing wall. Returns new room center or nil."
-  (when-let [[wx wy dx dy] (find-wall-attachment-point grid w h)]
-    ;; carve a room in the direction away from existing floor
-    (let [rw (+ 4 (rand-int 6))
-          rh (+ 3 (rand-int 4))
-          ;; position room based on direction
-          x1 (if (> dx 0) (+ wx 1) (if (< dx 0) (- wx rw) (- wx (quot rw 2))))
-          y1 (if (> dy 0) (+ wy 1) (if (< dy 0) (- wy rh) (- wy (quot rh 2))))
-          x2 (+ x1 rw -1)
-          y2 (+ y1 rh -1)
-          ;; clamp
-          x1 (max 1 x1) y1 (max 1 y1)
-          x2 (min (- w 2) x2) y2 (min (- h 2) y2)]
-      ;; check that area is all wall (no overlap with existing rooms)
-      (let [all-wall (atom true)]
+(defn attach-room!
+  "Try to attach a new room to an existing wall deterministically.
+   Returns [new-center-or-nil world']."
+  [world grid w h rooms]
+  (let [find-result (find-wall-attachment-point world grid w h)
+        anchor (first find-result)
+        w1 (second find-result)]
+    (if-not anchor
+      [nil w1]
+      (let [[wx wy dx dy] anchor
+            ;; rw, rh rolls
+            prw (det/int-in w1 0 6)
+            rw (+ 4 (first prw))
+            w2 (second prw)
+            prh (det/int-in w2 0 4)
+            rh (+ 3 (first prh))
+            w3 (second prh)
+            x1 (if (> dx 0) (+ wx 1) (if (< dx 0) (- wx rw) (- wx (quot rw 2))))
+            y1 (if (> dy 0) (+ wy 1) (if (< dy 0) (- wy rh) (- wy (quot rh 2))))
+            x2 (+ x1 rw -1)
+            y2 (+ y1 rh -1)
+            x1 (max 1 x1) y1 (max 1 y1)
+            x2 (min (- w 2) x2) y2 (min (- h 2) y2)
+            all-wall (atom true)]
         (doseq [ry (range y1 (inc y2))]
           (doseq [rx (range x1 (inc x2))]
             (when (not= 8 (tget grid w rx ry))
               (reset! all-wall false))))
-        (when @all-wall
-          ;; carve it
-          (carve-room! grid w x1 y1 x2 y2)
-          ;; open the wall tile as a door or floor
-          (tset! grid w wx wy (if (< (rand) 0.3) 11 1))
-          (let [cx (quot (+ x1 x2) 2) cy (quot (+ y1 y2) 2)]
+        (if-not @all-wall
+          [nil w3]
+          (let [;; door chance: percent? gives [bool world']
+                pdoor (det/percent? w3 30)
+                is-door (first pdoor)
+                w4 (second pdoor)
+                cx (quot (+ x1 x2) 2)
+                cy (quot (+ y1 y2) 2)]
+            (carve-room! grid w x1 y1 x2 y2)
+            (tset! grid w wx wy (if is-door 11 1))
             (swap! rooms conj [cx cy])
-            [cx cy]))))))
+            [[cx cy] w4]))))))
 
 ;; --- Level Generation ---
 
-(defn ensure-connectivity! [grid w h rooms]
-  "If the map is disconnected, carve extra corridors between room centers
-   until everything is reachable."
-  (let [rs (vec rooms)]
-    (when (> (count rs) 1)
-      (dotimes [attempt 20]
-        (when-not (is-connected? grid w h)
-          ;; pick two random room centers and connect them
-          (let [[x1 y1] (nth rs (rand-int (count rs)))
-                [x2 y2] (nth rs (rand-int (count rs)))]
-            (if (< (rand) 0.5)
-              (do (carve-h-corridor! grid w x1 x2 y1)
-                  (carve-v-corridor! grid w y1 y2 x2))
-              (do (carve-v-corridor! grid w y1 y2 x1)
-                  (carve-h-corridor! grid w x1 x2 y2)))))))))
+(defn ensure-connectivity!
+  "If the map is disconnected, carve extra corridors deterministically
+   between room centers until everything is reachable. Returns world'."
+  [world grid w h rooms]
+  (let [rs (vec rooms)
+        n (count rs)]
+    (if (<= n 1)
+      world
+      (let [w-ctx (det/with-context world [:terrain :ensure-conn])]
+        (loop [attempt 0 w-cur w-ctx]
+          (if (or (>= attempt 20) (is-connected? grid w h))
+            w-cur
+            (let [p1 (det/int-in w-cur 0 n)
+                  i1 (first p1)
+                  w1 (second p1)
+                  p2 (det/int-in w1 0 n)
+                  i2 (first p2)
+                  w2 (second p2)
+                  pd (det/percent? w2 50)
+                  go-h-first (first pd)
+                  w3 (second pd)
+                  [x1 y1] (nth rs i1)
+                  [x2 y2] (nth rs i2)]
+              (if go-h-first
+                (do (carve-h-corridor! grid w x1 x2 y1)
+                    (carve-v-corridor! grid w y1 y2 x2))
+                (do (carve-v-corridor! grid w y1 y2 x1)
+                    (carve-h-corridor! grid w x1 x2 y2)))
+              (recur (inc attempt) w3))))))))
 
 (defn place-room-in-sector!
-  "Place a room (rect or cave) in a given sector of the map."
-  [grid w h rooms sx sy sw sh cave-chance]
-  (let [use-cave (< (rand) cave-chance)
-        ;; pick a point within the sector
-        rx (+ sx 2 (rand-int (max 1 (- sw 5))))
-        ry (+ sy 2 (rand-int (max 1 (- sh 5))))]
+  "Place a room (rect or cave) in a given sector deterministically.
+   Returns world'."
+  [world grid w h rooms sx sy sw sh cave-chance]
+  (let [w-ctx (det/with-context world [:terrain :place-room sx sy])
+        pc (det/percent? w-ctx (int (* 100 cave-chance)))
+        use-cave (first pc)
+        w1 (second pc)
+        prx (det/int-in w1 0 (max 1 (- sw 5)))
+        rx (+ sx 2 (first prx))
+        w2 (second prx)
+        pry (det/int-in w2 0 (max 1 (- sh 5)))
+        ry (+ sy 2 (first pry))
+        w3 (second pry)]
     (if use-cave
-      (when-let [center (carve-cave-room! grid w h rx ry)]
-        (swap! rooms conj center))
-      (let [rw (+ 4 (rand-int 7))
-            rh (+ 3 (rand-int 4))
+      (let [cave-pair (carve-cave-room! w3 grid w h rx ry)
+            center (first cave-pair)
+            w4 (second cave-pair)]
+        (when center (swap! rooms conj center))
+        w4)
+      (let [prw (det/int-in w3 0 7)
+            rw (+ 4 (first prw))
+            w5 (second prw)
+            prh (det/int-in w5 0 4)
+            rh (+ 3 (first prh))
+            w6 (second prh)
             x1 (max 1 (min (- w rw 1) rx))
             y1 (max 1 (min (- h rh 1) ry))
             x2 (min (- w 2) (+ x1 rw -1))
             y2 (min (- h 2) (+ y1 rh -1))]
         (carve-room! grid w x1 y1 x2 y2)
-        (swap! rooms conj [(quot (+ x1 x2) 2) (quot (+ y1 y2) 2)])))))
+        (swap! rooms conj [(quot (+ x1 x2) 2) (quot (+ y1 y2) 2)])
+        w6))))
 
 (defn generate-level
-  ([w h] (generate-level w h 1))
-  ([w h depth]
+  ([w h] (generate-level w h 1 {:seed 0}))
+  ([w h depth] (generate-level w h depth {:seed depth}))
+  ([w h depth world]
   (let [grid (make-terrain w h)
         rooms (atom [])
         cave-chance (min 0.6 (+ 0.25 (* depth 0.05)))
-        ;; divide map into a grid of sectors for even room distribution
         cols 3
         rows 2
         sw (quot w cols)
-        sh (quot h rows)]
+        sh (quot h rows)
+        w0 (det/with-context world [:terrain :level w h depth])
 
-    ;; === Phase 1a: Place 1-2 rooms per sector for even coverage ===
-    (doseq [sy (range rows)]
-      (doseq [sx (range cols)]
-        (let [x0 (* sx sw) y0 (* sy sh)]
-          (place-room-in-sector! grid w h rooms x0 y0 sw sh cave-chance)
-          ;; second room in some sectors
-          (when (< (rand) 0.6)
-            (place-room-in-sector! grid w h rooms x0 y0 sw sh cave-chance)))))
+        ;; === Phase 1a: rooms per sector ===
+        w-phase1a
+        (loop [ys (vec (range rows))
+               w-cur w0]
+          (if (empty? ys)
+            w-cur
+            (let [sy (first ys)
+                  w-row
+                  (loop [xs (vec (range cols))
+                         w-x w-cur]
+                    (if (empty? xs)
+                      w-x
+                      (let [sx (first xs)
+                            x0 (* sx sw) y0 (* sy sh)
+                            w-first (place-room-in-sector! w-x grid w h rooms x0 y0 sw sh cave-chance)
+                            ;; second room: 60% chance
+                            ps (det/percent? w-first 60)
+                            do-second (first ps)
+                            w-after-pct (second ps)
+                            w-after (if do-second
+                                      (place-room-in-sector! w-after-pct grid w h rooms x0 y0 sw sh cave-chance)
+                                      w-after-pct)]
+                        (recur (rest xs) w-after))))]
+              (recur (rest ys) w-row))))
 
-    ;; === Phase 1b: A few more random rooms for variety ===
-    (dotimes [_ (+ 2 (rand-int 3))]
-      (place-room-in-sector! grid w h rooms 0 0 w h cave-chance))
+        ;; === Phase 1b: extra random rooms ===
+        pextra (det/int-in w-phase1a 0 3)
+        n-extra (+ 2 (first pextra))
+        w-after-extra-count (second pextra)
+        w-phase1b
+        (loop [i 0 w-cur w-after-extra-count]
+          (if (>= i n-extra)
+            w-cur
+            (recur (inc i)
+                   (place-room-in-sector! w-cur grid w h rooms 0 0 w h cave-chance))))
 
-    ;; === Phase 2: Connect rooms with corridors ===
-    ;; Shuffle rooms so corridors don't always go sector-by-sector
-    (let [shuffled (shuffle @rooms)]
-      (reset! rooms shuffled)
-      (doseq [i (range 1 (count @rooms))]
-        (let [[x1 y1] (nth @rooms (dec i))
-              [x2 y2] (nth @rooms i)]
-          (if (< (rand) 0.5)
-            (do (carve-h-corridor! grid w x1 x2 y1)
-                (carve-v-corridor! grid w y1 y2 x2))
-            (do (carve-v-corridor! grid w y1 y2 x1)
-                (carve-h-corridor! grid w x1 x2 y2))))))
+        ;; === Phase 2: corridors ===
+        shuf (det/permute w-phase1b @rooms)
+        shuffled (first shuf)
+        w-after-shuf (second shuf)
+        _ (reset! rooms shuffled)
+        w-phase2
+        (loop [i 1 w-cur w-after-shuf]
+          (if (>= i (count @rooms))
+            w-cur
+            (let [[x1 y1] (nth @rooms (dec i))
+                  [x2 y2] (nth @rooms i)
+                  pdir (det/percent? w-cur 50)
+                  go-h-first (first pdir)
+                  w-next (second pdir)]
+              (if go-h-first
+                (do (carve-h-corridor! grid w x1 x2 y1)
+                    (carve-v-corridor! grid w y1 y2 x2))
+                (do (carve-v-corridor! grid w y1 y2 x1)
+                    (carve-h-corridor! grid w x1 x2 y2)))
+              (recur (inc i) w-next))))
 
-    ;; === Phase 2b: Attach extra rooms to walls to fill space ===
-    (dotimes [_ 30]
-      (attach-room! grid w h rooms))
+        ;; === Phase 2b: attach extra rooms ===
+        w-phase2b
+        (loop [i 0 w-cur w-phase2]
+          (if (>= i 30)
+            w-cur
+            (let [r (attach-room! w-cur grid w h rooms)]
+              (recur (inc i) (second r)))))
 
-    ;; === Phase 2c: Ensure connectivity ===
-    (ensure-connectivity! grid w h @rooms)
+        ;; === Phase 2c: ensure connectivity ===
+        w-phase2c (ensure-connectivity! w-phase2b grid w h @rooms)
 
-    ;; === Phase 3: Place doors at corridor junctions (fewer: ~30%) ===
-    (doseq [y (range 1 (dec h))]
-      (doseq [x (range 1 (dec w))]
-        (when (= 1 (tget grid w x y))
-          (let [n (tget grid w x (dec y))
-                s (tget grid w x (inc y))
-                e (tget grid w (inc x) y)
-                wt (tget grid w (dec x) y)
-                h-door (and (= 8 n) (= 8 s) (= 1 e) (= 1 wt))
-                v-door (and (= 8 e) (= 8 wt) (= 1 n) (= 1 s))]
-            (when (and (or h-door v-door) (< (rand) 0.3))
-              (tset! grid w x y 11))))))
+        ;; === Phase 3: doors at corridor junctions ===
+        w-phase3
+        (loop [y 1 w-cur w-phase2c]
+          (if (>= y (dec h))
+            w-cur
+            (let [w-row
+                  (loop [x 1 w-x w-cur]
+                    (if (>= x (dec w))
+                      w-x
+                      (if (= 1 (tget grid w x y))
+                        (let [n (tget grid w x (dec y))
+                              s (tget grid w x (inc y))
+                              e (tget grid w (inc x) y)
+                              wt (tget grid w (dec x) y)
+                              h-door (and (= 8 n) (= 8 s) (= 1 e) (= 1 wt))
+                              v-door (and (= 8 e) (= 8 wt) (= 1 n) (= 1 s))]
+                          (if (or h-door v-door)
+                            (let [pd (det/percent? w-x 30)
+                                  put-door (first pd)
+                                  w-next (second pd)]
+                              (when put-door (tset! grid w x y 11))
+                              (recur (inc x) w-next))
+                            (recur (inc x) w-x)))
+                        (recur (inc x) w-x))))]
+              (recur (inc y) w-row))))
 
-    ;; === Phase 4: Lakes ===
-    ;; Water lakes — 2 to 3 per level, mix of medium and large
-    (dotimes [_ (+ 2 (rand-int 2))]
-      (place-lake! grid w h 4 3 2
-                   (if (< (rand) 0.4) :large :medium)))
+        ;; === Phase 4: Lakes ===
+        pwlakes (det/int-in w-phase3 0 2)
+        n-water (+ 2 (first pwlakes))
+        w-after-nw (second pwlakes)
+        w-water
+        (loop [i 0 w-cur w-after-nw]
+          (if (>= i n-water)
+            w-cur
+            (let [psize (det/percent? w-cur 40)
+                  big (first psize)
+                  w-after-size (second psize)
+                  lake-pair (place-lake! w-after-size grid w h 4 3 2
+                                         (if big :large :medium))
+                  w-next (second lake-pair)]
+              (recur (inc i) w-next))))
+        ;; Chasm — 60% chance
+        pcham (det/percent? w-water 60)
+        do-cham (first pcham)
+        w-after-cham-roll (second pcham)
+        w-cham
+        (if do-cham
+          (let [psize (det/percent? w-after-cham-roll 50)
+                big (first psize)
+                w-after-size (second psize)
+                lake-pair (place-lake! w-after-size grid w h 6 10 1
+                                       (if big :large :medium))]
+            (second lake-pair))
+          w-after-cham-roll)
+        ;; Lava — depth-gated, 33% chance after depth 4
+        w-lava
+        (if (>= depth 4)
+          (let [pl (det/percent? w-cham 33)
+                do-lava (first pl)
+                w-after-pct (second pl)]
+            (if do-lava
+              (let [lake-pair (place-lake! w-after-pct grid w h 7 nil 0
+                                           (if (>= depth 7) :medium :small))]
+                (second lake-pair))
+              w-after-pct))
+          w-cham)
 
-    ;; Chasm — common, can be very large (Brogue-style, up to 1/3 of level)
-    (when (< (rand) 0.6)
-      (place-lake! grid w h 6 10 1
-                   (if (< (rand) 0.5) :large :medium)))
+        ;; === Phase 5: Grass patches ===
+        pgr (det/int-in w-lava 0 5)
+        n-grass (+ 4 (first pgr))
+        w-after-ng (second pgr)
+        w-grass
+        (loop [i 0 w-cur w-after-ng]
+          (if (>= i n-grass)
+            w-cur
+            (recur (inc i) (place-grass-patch! w-cur grid w h))))
 
-    ;; Lava — scales with depth. Absent on floor 1, rare on 2-3, common on 4+
-    ;; Lava — Brogue style: absent before depth 4, then 33% chance per level
-    (when (>= depth 4)
-      (when (< (rand) 0.33)
-        (place-lake! grid w h 7 nil 0
-                     (if (>= depth 7) :medium :small))))
+        ;; === Phase 6: Bridges — shuffles candidate cells deterministically ===
+        w-bridges (build-bridges! w-grass grid w h)
 
-    ;; === Phase 5: Grass patches — generous, 4-8 patches ===
-    (dotimes [_ (+ 4 (rand-int 5))]
-      (place-grass-patch! grid w h))
+        ;; === Phase 7: Torches on walls — 4% chance per wall ===
+        w-torches
+        (loop [y 1 w-cur w-bridges]
+          (if (>= y (dec h))
+            w-cur
+            (let [w-row
+                  (loop [x 1 w-x w-cur]
+                    (if (>= x (dec w))
+                      w-x
+                      (if (and (= 8 (tget grid w x y))
+                               (let [adj-floor (or (contains? walkable-tiles (tget grid w (inc x) y))
+                                                   (contains? walkable-tiles (tget grid w (dec x) y))
+                                                   (contains? walkable-tiles (tget grid w x (inc y)))
+                                                   (contains? walkable-tiles (tget grid w x (dec y))))]
+                                 adj-floor))
+                        (let [pt (det/percent? w-x 4)
+                              put-torch (first pt)
+                              w-next (second pt)]
+                          (when put-torch (tset! grid w x y 9))
+                          (recur (inc x) w-next))
+                        (recur (inc x) w-x))))]
+              (recur (inc y) w-row))))
 
-    ;; === Phase 6: Build bridges across chasms/water ===
-    (build-bridges! grid w h)
+        ;; === Phase 8: Stairs (no rolls) ===
+        [sx sy] (first @rooms)
+        [ex ey] (last @rooms)
+        _ (tset! grid w sx sy 14)
+        _ (tset! grid w ex ey 13)]
 
-    ;; === Phase 7: Torches on walls ===
-    (doseq [y (range 1 (dec h))]
-      (doseq [x (range 1 (dec w))]
-        (when (and (= 8 (tget grid w x y))
-                   (< (rand) 0.04))
-          (let [adj-floor (or (contains? walkable-tiles (tget grid w (inc x) y))
-                              (contains? walkable-tiles (tget grid w (dec x) y))
-                              (contains? walkable-tiles (tget grid w x (inc y)))
-                              (contains? walkable-tiles (tget grid w x (dec y))))]
-            (when adj-floor
-              (tset! grid w x y 9))))))
-
-    ;; === Phase 8: Stairs ===
-    (let [[sx sy] (first @rooms)
-          [ex ey] (last @rooms)]
-      (tset! grid w sx sy 14)
-      (tset! grid w ex ey 13))
-
-    {:grid grid :rooms @rooms})))
+    [{:grid grid :rooms @rooms} w-torches])))
