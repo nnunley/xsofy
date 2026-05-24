@@ -8,3 +8,5 @@ debug.log
 xoy
 dist/
 .DS_Store
+run.py
+bin/lg
