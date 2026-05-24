@@ -114,35 +114,47 @@
 
 ;; --- Effect Primitives (do things at cursors) ---
 
+(defn reduce-cursor-targets
+  "Thread an accumulator through each cursor and the entities targeted there.
+   The accumulator's first slot is the current world so target lookup sees prior updates."
+  [ctx init targets-at-pos step]
+  (reduce
+    (fn [acc pos]
+      (let [world (first acc)
+            targets (targets-at-pos world pos)]
+        (reduce (fn [acc e] (step acc pos e))
+                acc
+                targets)))
+    init
+    (:cursors ctx)))
+
 (defn r-damage [ctx amount]
   (let [[w total new-hits]
-        (reduce
-          (fn [[world total hits] pos]
-            (let [targets (u/targets-at world pos (:caster ctx))]
-              (reduce (fn [[w total hits] e]
-                        (let [armor (get-in e [:body :armor] 0)
-                              actual (max 1 (- amount armor))]
-                          [(ent/damage-entity w (:id e) actual)
-                           (+ total actual)
-                           (conj hits (:id e))]))
-                      [world total hits]
-                      targets)))
+        (reduce-cursor-targets
+          ctx
           [(:world ctx) 0 (:hits ctx)]
-          (:cursors ctx))]
+          (fn [world pos]
+            (u/targets-at world pos (:caster ctx)))
+          (fn [[world total hits] _ e]
+            (let [armor (get-in e [:body :armor] 0)
+                  actual (max 1 (- amount armor))]
+              [(ent/damage-entity world (:id e) actual)
+               (+ total actual)
+               (conj hits (:id e))])))]
     (assoc ctx :world w :result total :hits new-hits)))
 
 (defn r-heal [ctx amount]
-  (let [w (reduce
-            (fn [world pos]
-              (let [targets (u/entities-at world pos)]
-                (reduce (fn [w e]
-                          (let [hp (get-in e [:body :hp] 0)
-                                max-hp (get-in e [:body :max-hp] hp)
-                                new-hp (min max-hp (+ hp amount))]
-                            (assoc-in w [:entities (:id e) :body :hp] new-hp)))
-                        world targets)))
-            (:world ctx)
-            (:cursors ctx))]
+  (let [[w]
+        (reduce-cursor-targets
+          ctx
+          [(:world ctx)]
+          (fn [world pos]
+            (u/entities-at world pos))
+          (fn [[world] _ e]
+            (let [hp (get-in e [:body :hp] 0)
+                  max-hp (get-in e [:body :max-hp] hp)
+                  new-hp (min max-hp (+ hp amount))]
+              [(assoc-in world [:entities (:id e) :body :hp] new-hp)])))]
     (assoc ctx :world w :result amount)))
 
 (defn r-fire
@@ -151,15 +163,16 @@
    (let [power (if (number? power) (max 1 power) 1)
          ttl (+ 3 power)
          burn-ttl (* 12 power)
-         w (reduce
-             (fn [world pos]
-               (let [[x y] pos
-                     world (fire/ignite-forced world x y ttl)
-                     targets (u/targets-at world pos nil)]
-                 (reduce (fn [w e] (status/apply-status w (:id e) :burning burn-ttl))
-                         world targets)))
-             (:world ctx)
-             (:cursors ctx))]
+         [w]
+         (reduce-cursor-targets
+           ctx
+           [(:world ctx)]
+           (fn [world pos]
+             (u/targets-at (fire/ignite-forced world (first pos) (second pos) ttl)
+                           pos nil))
+           (fn [[world] pos e]
+             (let [world (fire/ignite-forced world (first pos) (second pos) ttl)]
+               [(status/apply-status world (:id e) :burning burn-ttl)])))]
      (assoc ctx :world w))))
 
 (defn r-ice
@@ -167,15 +180,16 @@
   ([ctx power]
    (let [power (if (number? power) (max 1 power) 1)
          ttl (* 8 power)
-         w (reduce
-             (fn [world pos]
-               (let [[x y] pos
-                     world (fx/add-stain world x y :water 2)
-                     targets (u/targets-at world pos nil)]
-                 (reduce (fn [w e] (status/apply-status w (:id e) :frozen ttl))
-                         world targets)))
-             (:world ctx)
-             (:cursors ctx))]
+         [w]
+         (reduce-cursor-targets
+           ctx
+           [(:world ctx)]
+           (fn [world pos]
+             (u/targets-at (fx/add-stain world (first pos) (second pos) :water 2)
+                           pos nil))
+           (fn [[world] pos e]
+             (let [world (fx/add-stain world (first pos) (second pos) :water 2)]
+               [(status/apply-status world (:id e) :frozen ttl)])))]
      (assoc ctx :world w))))
 
 ;; Tiles you can be pushed into (walkable + hazards)
@@ -184,37 +198,38 @@
 (defn r-push [ctx]
   (let [origin (:origin ctx)
         {:keys [terrain width height]} (:world ctx)]
-    (let [w (reduce
-              (fn [world pos]
-                (let [targets (u/targets-at world pos (:caster ctx))]
-                  (reduce (fn [w e]
-                            (let [epos (:pos e)]
-                              (if (nil? epos) w
-                                (let [[ex ey] epos
-                                      [ox oy] origin
-                                      dx (- ex ox) dy (- ey oy)
-                                      len (max 1 (math/sqrt (+ (* dx dx) (* dy dy))))
-                                      ndx (int (/ dx len)) ndy (int (/ dy len))
-                                      nx (+ ex ndx) ny (+ ey ndy)
-                                      dest-tile (terrain/tget terrain width nx ny)
-                                      occupant (ent/creature-at w [nx ny])]
-                                  (cond
-                                    ;; occupied: both exchange hits (bump damage)
-                                    (and occupant (not= (:id occupant) (:id e)))
-                                    (let [w (ent/damage-entity w (:id e) 2)
-                                          w (if (get-in w [:entities (:id occupant)])
-                                              (ent/damage-entity w (:id occupant) 2)
-                                              w)]
-                                      w)
-                                    ;; pushable tile (walkable + hazards like lava/chasm/deep water)
-                                    (and (>= nx 0) (< nx width) (>= ny 0) (< ny height)
-                                         (contains? pushable-tiles dest-tile))
-                                    (assoc-in w [:entities (:id e) :pos] [nx ny])
-                                    ;; wall or void — can't push
-                                    :else w)))))
-                          world targets)))
-              (:world ctx)
-              (:cursors ctx))]
+    (let [[w]
+          (reduce-cursor-targets
+            ctx
+            [(:world ctx)]
+            (fn [world pos]
+              (u/targets-at world pos (:caster ctx)))
+            (fn [[world] _ e]
+              (let [epos (:pos e)]
+                (if (nil? epos)
+                  [world]
+                  (let [[ex ey] epos
+                        [ox oy] origin
+                        dx (- ex ox) dy (- ey oy)
+                        len (max 1 (math/sqrt (+ (* dx dx) (* dy dy))))
+                        ndx (int (/ dx len)) ndy (int (/ dy len))
+                        nx (+ ex ndx) ny (+ ey ndy)
+                        dest-tile (terrain/tget terrain width nx ny)
+                        occupant (ent/creature-at world [nx ny])]
+                    (cond
+                      ;; occupied: both exchange hits (bump damage)
+                      (and occupant (not= (:id occupant) (:id e)))
+                      (let [world (ent/damage-entity world (:id e) 2)
+                            world (if (get-in world [:entities (:id occupant)])
+                                    (ent/damage-entity world (:id occupant) 2)
+                                    world)]
+                        [world])
+                      ;; pushable tile (walkable + hazards like lava/chasm/deep water)
+                      (and (>= nx 0) (< nx width) (>= ny 0) (< ny height)
+                           (contains? pushable-tiles dest-tile))
+                      [(assoc-in world [:entities (:id e) :pos] [nx ny])]
+                      ;; wall or void — can't push
+                      :else [world]))))))]
       (assoc ctx :world w))))
 
 (def arc-range 6)
