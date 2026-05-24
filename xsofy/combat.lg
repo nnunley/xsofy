@@ -19,13 +19,8 @@
 
 ;; --- Damage Roll ---
 
-(defn roll-damage [min-dmg max-dmg net-enchant]
-  (let [base (+ min-dmg (rand-int (max 1 (inc (- max-dmg min-dmg)))))
-        scale (enchant-scale net-enchant)]
-    (max 1 (int (* base scale)))))
-
 (defn roll-damage-det
-  "Deterministic variant of roll-damage. Takes world, returns [damage world']."
+  "Rolls damage deterministically. Takes world, returns [damage world']."
   [world min-dmg max-dmg net-enchant]
   (let [span (max 1 (inc (- max-dmg min-dmg)))
         roll-pair (det/int-in world 0 span)
@@ -41,11 +36,8 @@
   (let [chance (* accuracy (math/pow 0.987 (float defense)))]
     (max 0 (min 100 (int chance)))))
 
-(defn hit? [accuracy defense]
-  (< (rand-int 100) (hit-chance accuracy defense)))
-
 (defn hit-det?
-  "Deterministic variant of hit?. Takes world, returns [bool world']."
+  "Deterministic hit check. Takes world, returns [bool world']."
   [world accuracy defense]
   (let [pct (hit-chance accuracy defense)
         pair (det/percent? world pct)
@@ -117,27 +109,8 @@
 
 ;; --- Full Attack Resolution ---
 
-(defn resolve-attack [world attacker-id target-id]
-  (let [attacker (get-in world [:entities attacker-id])
-        target (get-in world [:entities target-id])]
-    (when (and attacker target)
-      (let [atk (attacker-stats world attacker-id)
-            def_ (defender-stats world target-id)
-            net-enchant (+ (:enchant atk) (strength-modifier (:str atk) (:str-req atk)))
-            sneak (= (:ai-state def_) :sleep)
-            did-hit (or sneak (hit? (:accuracy atk) (:defense def_)))
-            raw-dmg (if did-hit (roll-damage (:min-dmg atk) (:max-dmg atk) net-enchant) 0)
-            sneak-mult (if (and did-hit sneak) (sneak-multiplier (:weapon atk)) 1)
-            final-dmg (if did-hit (max 1 (* raw-dmg sneak-mult)) 0)
-            speed (attack-speed (:weapon atk) did-hit)]
-        {:hit did-hit
-         :damage final-dmg
-         :speed speed
-         :sneak (and did-hit sneak (> sneak-mult 1))
-         :net-enchant net-enchant}))))
-
 (defn resolve-attack-det
-  "Deterministic variant of resolve-attack. Takes world, returns [result world']
+  "Full attack resolution. Takes world, returns [result world']
    where result is {:hit :damage :speed :sneak :net-enchant} or nil if either
    entity is missing."
   [world attacker-id target-id]

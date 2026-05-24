@@ -20,12 +20,6 @@
         new-intensity (min 5 (+ old-int intensity))]
     (assoc world :stains (assoc stains [x y] {:type stype :intensity new-intensity}))))
 
-(defn blood-drop [world cx cy]
-  "Single blood drop at or near position."
-  (let [dx (- (rand-int 3) 1)
-        dy (- (rand-int 3) 1)]
-    (add-stain world (+ cx dx) (+ cy dy) :blood 1)))
-
 (defn blood-drop-det
   "Deterministic blood drop. Returns world'."
   [world cx cy]
@@ -35,16 +29,6 @@
         dx (- px 1)
         dy (- py 1)]
     (add-stain w (+ cx dx) (+ cy dy) :blood 1)))
-
-(defn blood-puddle [world cx cy]
-  "Big puddle — center + random neighbors."
-  (let [w (add-stain world cx cy :blood 4)]
-    (reduce (fn [w [dx dy]]
-              (if (< (rand-int 3) 2)
-                (add-stain w (+ cx dx) (+ cy dy) :blood (+ 1 (rand-int 3)))
-                w))
-            w
-            u/dirs8)))
 
 (defn blood-puddle-det
   "Deterministic blood puddle. Returns world'."
@@ -56,36 +40,6 @@
                 (if (< r1 2)
                   (let [[r2 w] (det/int-in w 0 3)]
                     (add-stain w (+ cx dx) (+ cy dy) :blood (+ 1 r2)))
-                  w)))
-            w-ctx
-            u/dirs8)))
-
-(defn splatter [world cx cy stype intensity radius]
-  "Generic splatter."
-  (let [w (add-stain world cx cy stype intensity)]
-    (reduce (fn [w [dx dy]]
-              (let [nx (+ cx dx) ny (+ cy dy)]
-                (if (and (<= (+ (* dx dx) (* dy dy)) (* radius radius))
-                         (< (rand-int 3) intensity))
-                  (add-stain w nx ny stype (max 1 (dec intensity)))
-                  w)))
-            w
-            u/dirs8)))
-
-(defn splatter-det
-  "Deterministic splatter. Returns world'."
-  [world cx cy stype intensity radius]
-  (let [w0 (add-stain world cx cy stype intensity)
-        w-ctx (det/with-context w0 [:fx :splatter stype cx cy])]
-    (reduce (fn [w [dx dy]]
-              (let [nx (+ cx dx) ny (+ cy dy)]
-                (if (<= (+ (* dx dx) (* dy dy)) (* radius radius))
-                  (let [pair (det/int-in w 0 3)
-                        keep? (< (first pair) intensity)
-                        w' (second pair)]
-                    (if keep?
-                      (add-stain w' nx ny stype (max 1 (dec intensity)))
-                      w'))
                   w)))
             w-ctx
             u/dirs8)))

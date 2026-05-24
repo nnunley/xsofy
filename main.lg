@@ -1,3 +1,6 @@
+(require 'ir.passes.pipeline)
+;;;(alter-var-root #'*ir-compile* (constantly true))
+
 (ns xsofy.main
   (:require [term]
             [os]
@@ -10,6 +13,7 @@
             [xsofy.runes :as runes]
             [xsofy.title :as title]
             [xsofy.debug :as dbg]))
+
 
 (defn init-terminal []
   (when (nil? (term/size))
